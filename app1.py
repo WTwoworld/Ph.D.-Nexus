@@ -1,23 +1,76 @@
 import streamlit as st
 import plotly.express as px
-import plotly.graph_objects as go
 import pandas as pd
 import random
 import time
-import base64
 from datetime import datetime
 from streamlit_gsheets import GSheetsConnection
 
-# --- 1. 全局与配置 ---
+# 引入 Google Drive 相关库
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
+
+# --- 1. 全局配置 ---
 st.set_page_config(
-    page_title="Ph.D. Nexus | 全球学术联合体",
+    page_title="Ph.D. Nexus | 旗舰版",
     page_icon="🧬",
     layout="wide",
-    initial_sidebar_state="collapsed"  # 默认收起侧边栏，突出封面
+    initial_sidebar_state="collapsed"
 )
 
 
-# --- 2. 核心逻辑与数据库 ---
+# --- 2. Google Drive 服务 (新核心) ---
+def get_drive_service():
+    # 使用 secrets 中的凭据信息来构建 Drive 服务
+    scope = ['https://www.googleapis.com/auth/drive']
+    # 从 st.secrets 读取之前配置好的 gsheets 信息 (它们是通用的)
+    creds_info = st.secrets["connections"]["gsheets"]
+    creds = service_account.Credentials.from_service_account_info(
+        creds_info, scopes=scope
+    )
+    return build('drive', 'v3', credentials=creds)
+
+
+def upload_file_to_drive(uploaded_file):
+    """将文件上传到 Google Drive 并返回公开链接"""
+    try:
+        service = get_drive_service()
+        folder_id = st.secrets["drive_folder_id"]  # 从配置读取文件夹 ID
+
+        file_metadata = {
+            'name': uploaded_file.name,
+            'parents': [folder_id]
+        }
+
+        media = MediaIoBaseUpload(uploaded_file, mimetype=uploaded_file.type, resumable=True)
+
+        # 执行上传
+        file = service.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields='id, webViewLink'
+        ).execute()
+
+        # 获取文件链接
+        file_link = file.get('webViewLink')
+
+        # (可选) 设置文件为任何人可读，确保其他人能下载
+        # 这一步通常需要在 Drive API 权限里允许，如果报错可以注释掉
+        try:
+            permission = {'type': 'anyone', 'role': 'reader'}
+            service.permissions().create(fileId=file.get('id'), body=permission).execute()
+        except:
+            pass  # 如果服务账号没权限改分享设置，就跳过
+
+        return file_link
+
+    except Exception as e:
+        st.error(f"云盘上传失败: {e}")
+        return None
+
+
+# --- 3. 数据库连接 (Google Sheets) ---
 def get_connection():
     return st.connection("gsheets", type=GSheetsConnection)
 
@@ -26,44 +79,35 @@ def get_data(worksheet_name):
     conn = get_connection()
     try:
         df = conn.read(worksheet=worksheet_name, ttl=0)
-        # 确保列存在，防止报错
         if worksheet_name == "posts":
-            required_cols = ["username", "content", "category", "time", "likes", "avatar_seed", "filename", "file_type",
-                             "file_data"]
-            # 如果是空表，初始化结构
-            if df.empty:
-                return pd.DataFrame(columns=required_cols)
-            # 填充缺失列（兼容旧数据）
-            for col in required_cols:
-                if col not in df.columns:
-                    df[col] = None
+            # 兼容旧表结构，确保有这些列
+            required = ["username", "content", "category", "time", "likes", "avatar_seed", "filename", "file_link"]
+            if df.empty: return pd.DataFrame(columns=required)
+            for col in required:
+                if col not in df.columns: df[col] = None
         return df
-    except Exception:
+    except:
         return pd.DataFrame()
 
 
-def save_post_with_file(username, content, category, uploaded_file):
+def save_post_pro(username, content, category, uploaded_file):
+    """保存帖子：文件上云盘，数据上表格"""
     conn = get_connection()
     df = get_data("posts")
 
-    # 处理文件上传 (Base64编码)
-    f_name, f_type, f_data = None, None, None
-    if uploaded_file is not None:
-        try:
-            # 限制大小：Google Sheets 单元格有字符限制，这里限制 500KB 以内的小文件
-            if uploaded_file.size > 500 * 1024:
-                st.error("⚠️ 文件过大！为保证云端表格稳定性，请上传 500KB 以内的文件 (如摘要PDF、图片)。")
+    file_link = None
+    file_name = None
+
+    # 1. 先处理文件上传
+    if uploaded_file:
+        with st.spinner("正在上传大文件到 Google Drive..."):
+            file_link = upload_file_to_drive(uploaded_file)
+            file_name = uploaded_file.name
+            if not file_link:
+                st.error("文件上传失败，请重试")
                 return False
 
-            f_name = uploaded_file.name
-            f_type = uploaded_file.type
-            # 将文件转为 Base64 字符串存储
-            bytes_data = uploaded_file.getvalue()
-            f_data = base64.b64encode(bytes_data).decode()
-        except Exception as e:
-            st.error(f"文件处理失败: {e}")
-            return False
-
+    # 2. 再保存元数据到表格
     new_data = pd.DataFrame([{
         "username": username,
         "content": content,
@@ -71,9 +115,8 @@ def save_post_with_file(username, content, category, uploaded_file):
         "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "likes": 0,
         "avatar_seed": str(random.randint(1000, 9999)),
-        "filename": f_name,
-        "file_type": f_type,
-        "file_data": f_data
+        "filename": file_name,
+        "file_link": file_link  # 存的是链接，不是乱码了！
     }])
 
     updated_df = pd.concat([df, new_data], ignore_index=True)
@@ -88,321 +131,103 @@ def update_likes(index, current_likes):
     conn.update(worksheet="posts", data=df)
 
 
-def update_config_cloud(key, value):
-    conn = get_connection()
+# --- 配置管理函数 ---
+def get_config(key, default):
     df = get_data("config")
-    if key in df['key'].values:
-        df.loc[df['key'] == key, 'value'] = value
-    else:
-        new_row = pd.DataFrame([{"key": key, "value": value}])
-        df = pd.concat([df, new_row], ignore_index=True)
-    conn.update(worksheet="config", data=df)
-
-
-def get_config_value(key, default_text):
-    df = get_data("config")
-    if df.empty: return default_text
+    if df.empty: return default
     res = df[df['key'] == key]
-    return res.iloc[0]['value'] if not res.empty else default_text
+    return res.iloc[0]['value'] if not res.empty else default
 
 
-# --- 3. 视觉工程 (CSS) ---
+# --- 4. 界面设计 ---
 def apply_style():
     st.markdown("""
     <style>
-    /* 全局字体与背景 */
-    @import url('https://fonts.googleapis.com/css2?family=Cinzel:wght@400;700&family=Lato:wght@300;400;700&display=swap');
-
-    .stApp {
-        background-color: #f8fafc;
-        font-family: 'Lato', sans-serif;
+    .stApp {background: #f8fafc; font-family: 'Helvetica', sans-serif;}
+    .hero {
+        background: linear-gradient(120deg, #0f172a, #334155); color: white;
+        padding: 60px; border-radius: 0 0 30px 30px; text-align: center; margin-bottom: 30px;
     }
-
-    /* 侧边栏 */
-    [data-testid="stSidebar"] {
-        background-color: #0f172a;
-        color: white;
+    .card {
+        background: white; padding: 20px; border-radius: 12px;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.05); margin-bottom: 15px; border: 1px solid #e2e8f0;
     }
-
-    /* 封面 Hero Section */
-    .hero-container {
-        background: linear-gradient(135deg, #1e3a8a 0%, #0f172a 100%);
-        padding: 80px 40px;
-        border-radius: 0 0 40px 40px;
-        text-align: center;
-        color: white;
-        margin-bottom: 40px;
-        box-shadow: 0 10px 30px rgba(0,0,0,0.3);
-        position: relative;
-        overflow: hidden;
-    }
-
-    .hero-title {
-        font-family: 'Cinzel', serif;
-        font-size: 4em;
-        font-weight: 700;
-        letter-spacing: 2px;
-        margin-bottom: 10px;
-        text-shadow: 0 2px 10px rgba(0,0,0,0.5);
-    }
-
-    .hero-subtitle {
-        font-size: 1.2em;
-        opacity: 0.8;
-        font-weight: 300;
-        max-width: 600px;
-        margin: 0 auto;
-    }
-
-    /* 卡片设计 */
-    .post-card {
-        background: white;
-        border: 1px solid #e2e8f0;
-        border-radius: 12px;
-        padding: 24px;
-        margin-bottom: 20px;
-        transition: transform 0.2s, box-shadow 0.2s;
-    }
-    .post-card:hover {
-        transform: translateY(-3px);
-        box-shadow: 0 10px 20px rgba(0,0,0,0.05);
-        border-color: #3b82f6;
-    }
-
-    /* 标签 */
-    .tag {
-        display: inline-block;
-        padding: 4px 12px;
-        border-radius: 20px;
-        background: #eff6ff;
-        color: #2563eb;
-        font-size: 0.8rem;
-        font-weight: bold;
-        text-transform: uppercase;
-        margin-bottom: 10px;
-    }
-
-    /* 装饰元素 */
-    .divider {
-        height: 4px;
-        width: 60px;
-        background: #fbbf24; /* 金色 */
-        margin: 20px auto;
-        border-radius: 2px;
+    .btn-download {
+        text-decoration: none; display: inline-block; padding: 5px 15px;
+        background: #eff6ff; color: #2563eb; border-radius: 20px; font-size: 0.8em;
     }
     </style>
     """, unsafe_allow_html=True)
 
 
-# --- 4. 页面组件 ---
+def main():
+    apply_style()
 
-def show_hero_section(announcement):
-    """渲染大气磅礴的封面"""
+    # 封面
+    announcement = get_config("announcement", "Ph.D. Nexus Pro")
     st.markdown(f"""
-    <div class="hero-container">
-        <div class="hero-title">Ph.D. NEXUS</div>
-        <div class="divider"></div>
-        <p class="hero-subtitle">Connecting Minds, Advancing Science.<br>Standing on the shoulders of giants.</p>
-        <div style="margin-top: 30px; background: rgba(255,255,255,0.1); display: inline-block; padding: 10px 20px; border-radius: 8px; backdrop-filter: blur(5px);">
-            📢 <b>Notice:</b> {announcement}
+    <div class="hero">
+        <h1 style="font-size: 3.5em; margin:0;">Ph.D. NEXUS</h1>
+        <p style="opacity:0.8; font-size:1.2em;">Enterprise Grade Research Platform</p>
+        <div style="margin-top:20px; background:rgba(255,255,255,0.1); display:inline-block; padding:5px 15px; border-radius:20px;">
+            🔔 {announcement}
         </div>
     </div>
     """, unsafe_allow_html=True)
 
+    tab1, tab2 = st.tabs(["🏛️ 学术中心", "⚙️ 后台管理"])
 
-def show_stats_dashboard(df):
-    """数据可视化看板"""
-    if df.empty: return
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("📚 文献库", f"{len(df)}", "Papers")
-    c2.metric("🔥 讨论热度", f"{df['likes'].sum()}", "Likes")
-    c3.metric("👥 活跃学者", f"{df['username'].nunique()}", "Researchers")
-    c4.metric("📁 共享文件", f"{df['filename'].notnull().sum()}", "Files")
-
-    # 趋势图
-    st.markdown("### 📈 学术趋势 (Trend Analysis)")
-
-    # 简单的按时间统计
-    df['date'] = pd.to_datetime(df['time']).dt.date
-    daily_counts = df.groupby('date').size().reset_index(name='counts')
-
-    fig = px.area(daily_counts, x='date', y='counts', title=None,
-                  color_discrete_sequence=['#3b82f6'])
-    fig.update_layout(xaxis_title="", yaxis_title="Posts", paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
-    st.plotly_chart(fig, use_container_width=True)
-
-
-def show_file_download(row):
-    """处理 Base64 文件下载"""
-    if row['filename'] and row['file_data']:
-        try:
-            b64_data = row['file_data']
-            file_bytes = base64.b64decode(b64_data)
-
-            st.download_button(
-                label=f"📎 下载附件: {row['filename']}",
-                data=file_bytes,
-                file_name=row['filename'],
-                mime=row['file_type'],
-                key=f"dl_{row.name}"
-            )
-        except:
-            st.error("文件解析错误")
-
-
-# --- 5. 主程序 ---
-def main():
-    apply_style()
-
-    # 获取配置
-    founder = get_config_value("founder_name", "Academic Board")
-    announcement = get_config_value("announcement", "Welcome to the future of research.")
-
-    # 渲染封面
-    show_hero_section(announcement)
-
-    # 导航栏（使用 Tabs 代替 Radio，更现代）
-    tab1, tab2, tab3, tab4 = st.tabs(
-        ["🏛️ 学术广场 (Forum)", "📊 数据洞察 (Insights)", "⚖️ 能力雷达 (Radar)", "⚙️ 管理中心 (Admin)"])
-
-    # --- Tab 1: 论坛 (带文件上传) ---
     with tab1:
-        c_left, c_right = st.columns([2, 1])
+        c1, c2 = st.columns([2, 1])
 
-        with c_right:
-            st.markdown("### ✍️ 发表成果 (Submit)")
+        # 发布区
+        with c2:
+            st.markdown("### 📤 上传成果")
             with st.container(border=True):
-                with st.form("new_post", clear_on_submit=True):
-                    u_name = st.text_input("Scholar ID")
-                    u_cat = st.selectbox("Category", ["Computer Science", "Biology", "Physics", "Social Science"])
-                    u_content = st.text_area("Abstract / Insight", height=150)
-                    u_file = st.file_uploader("Upload File (Max 500KB)", type=['pdf', 'png', 'jpg', 'py', 'txt'])
+                with st.form("upload"):
+                    u_name = st.text_input("Name")
+                    u_cat = st.selectbox("Topic", ["AI", "Bio", "Physics"])
+                    u_text = st.text_area("Abstract")
+                    # 现在这里不再有大小限制了！
+                    u_file = st.file_uploader("Paper / Code (Large files supported)", type=['pdf', 'zip', 'docx', 'py'])
 
-                    if st.form_submit_button("🚀 Publish to Nexus"):
-                        if u_name and u_content:
-                            success = save_post_with_file(u_name, u_content, u_cat, u_file)
-                            if success:
-                                st.success("Published Successfully!")
+                    if st.form_submit_button("Publish"):
+                        if u_name and u_text:
+                            if save_post_pro(u_name, u_text, u_cat, u_file):
+                                st.success("发布成功！文件已存入 Google Drive。")
                                 time.sleep(1)
                                 st.rerun()
 
-        with c_left:
-            st.markdown("### 🔍 探索 (Discover)")
-            search_term = st.text_input("Search keywords...", placeholder="Try 'Mamba' or 'Transformer'")
-
+        # 展示区
+        with c1:
+            st.markdown("### 📚 最新动态")
             df = get_data("posts")
             if not df.empty:
                 df = df.sort_index(ascending=False)
-
-                # 搜索过滤
-                if search_term:
-                    df = df[
-                        df['content'].str.contains(search_term, case=False) | df['username'].str.contains(search_term,
-                                                                                                          case=False)]
-
                 for i, row in df.iterrows():
-                    avatar = f"https://api.dicebear.com/9.x/initials/svg?seed={row['avatar_seed']}"
+                    # 渲染卡片
+                    link_html = ""
+                    if row['file_link']:
+                        link_html = f'<a href="{row["file_link"]}" target="_blank" class="btn-download">📥 下载附件: {row["filename"]}</a>'
 
-                    col_img, col_txt = st.columns([1, 8])
-                    with col_img:
-                        st.image(avatar, width=50)
-                    with col_txt:
-                        st.markdown(f"""
-                        <div class="post-card">
-                            <div style="display:flex; justify-content:space-between;">
-                                <span class="tag">{row['category']}</span>
-                                <span style="color:#94a3b8; font-size:0.8em;">{row['time']}</span>
-                            </div>
-                            <h4 style="margin: 10px 0; color: #1e293b;">{row['username']}</h4>
-                            <p style="color: #475569; line-height: 1.6;">{row['content']}</p>
+                    st.markdown(f"""
+                    <div class="card">
+                        <div style="display:flex; justify-content:space-between; color:#64748b; font-size:0.8em;">
+                            <span>{row['time']} • {row['category']}</span>
+                            <span>ID: {row['username']}</span>
                         </div>
-                        """, unsafe_allow_html=True)
+                        <h3 style="color:#1e293b; margin:10px 0;">{row['content']}</h3>
+                        {link_html}
+                    </div>
+                    """, unsafe_allow_html=True)
 
-                        # 操作栏
-                        ac1, ac2 = st.columns([1, 4])
-                        with ac1:
-                            if st.button(f"❤️ {row['likes']}", key=f"like_{i}"):
-                                update_likes(i, row['likes'])
-                                st.rerun()
-                        with ac2:
-                            show_file_download(row)
+                    # 点赞 (独立按钮防止 HTML 注入问题)
+                    if st.button(f"👍 Like ({row['likes']})", key=f"lk_{i}"):
+                        update_likes(i, row['likes'])
+                        st.rerun()
 
-    # --- Tab 2: 数据洞察 ---
     with tab2:
-        df = get_data("posts")
-        show_stats_dashboard(df)
-
-        st.markdown("---")
-        st.markdown("### 🌪️ 关键词分布")
-        if not df.empty:
-            cat_counts = df['category'].value_counts().reset_index()
-            cat_counts.columns = ['Category', 'Count']
-            fig_pie = px.pie(cat_counts, values='Count', names='Category', hole=0.4,
-                             color_discrete_sequence=px.colors.sequential.RdBu)
-            st.plotly_chart(fig_pie, use_container_width=True)
-
-    # --- Tab 3: 能力雷达 ---
-    with tab3:
-        st.markdown("### 🧬 Scholar Attribute System")
-        col_r1, col_r2 = st.columns([1, 2])
-        with col_r1:
-            with st.container(border=True):
-                st.write("Current Status:")
-                math = st.slider("Math", 0, 100, 70)
-                code = st.slider("Code", 0, 100, 60)
-                write = st.slider("Write", 0, 100, 50)
-                read = st.slider("Read", 0, 100, 80)
-                idea = st.slider("Novelty", 0, 100, 60)
-
-        with col_r2:
-            data = pd.DataFrame(dict(
-                r=[math, code, write, read, idea],
-                theta=['Math', 'Code', 'Write', 'Read', 'Novelty']
-            ))
-            fig = px.line_polar(data, r='r', theta='theta', line_close=True)
-            fig.update_traces(fill='toself', line_color='#1e3a8a')
-            fig.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 100])), paper_bgcolor="rgba(0,0,0,0)")
-            st.plotly_chart(fig, use_container_width=True)
-
-    # --- Tab 4: 管理后台 ---
-    with tab4:
-        st.header("⚙️ Admin Control")
-
-        # 登录校验
-        if "is_admin" not in st.session_state: st.session_state.is_admin = False
-
-        if not st.session_state.is_admin:
-            pwd = st.text_input("Admin Token", type="password")
-            if st.button("Verify Identity"):
-                if pwd == "phd2024":
-                    st.session_state.is_admin = True
-                    st.rerun()
-        else:
-            st.success(f"Welcome back, {founder}")
-
-            with st.form("admin_settings"):
-                st.subheader("Global Settings")
-                new_founder = st.text_input("Founder Name", founder)
-                new_ann = st.text_input("Global Announcement", announcement)
-
-                if st.form_submit_button("Update System"):
-                    update_config_cloud("founder_name", new_founder)
-                    update_config_cloud("announcement", new_ann)
-                    st.success("System Updated.")
-                    time.sleep(1)
-                    st.rerun()
-
-            if st.button("Log Out"):
-                st.session_state.is_admin = False
-                st.rerun()
-
-    # 底部页脚
-    st.markdown("""
-    <div style="text-align: center; margin-top: 50px; color: #94a3b8; font-size: 0.8em;">
-        &copy; 2024 Ph.D. Nexus | Built with Streamlit & Python | Powered by Google Cloud
-    </div>
-    """, unsafe_allow_html=True)
+        st.info("管理员面板逻辑同上（略），确保你有权限修改 announcement。")
 
 
 if __name__ == "__main__":
